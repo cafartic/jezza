@@ -817,39 +817,14 @@ async function fetchTips() {
 
   const today = new Date().toLocaleDateString('en-AU', { weekday:'long', year:'numeric', month:'long', day:'numeric' });
 
-  const prompt = `Today is ${today}. You are Jezza5000, an AFL tipping assistant.
+  const prompt = `Today: ${today}. AFL tipping assistant task.
 
-STEP 1: Use web_search to fetch the current AFL round fixtures and Squiggle model tips.
-Search for: "squiggle AFL tips round 2026 site:api.squiggle.com.au"
-Also search: "AFL round ${YEAR} fixtures upcoming games this week"
-Also search for current betting odds and injury news.
+Search for: AFL round 2026 upcoming fixtures this week, Squiggle model tips, betting odds, injury news.
 
-STEP 2: Identify the current round (games not yet played as of today).
+Find unplayed games this round. For each game tip the favourite using bookmaker odds as baseline, Squiggle models as support. Be conservative.
 
-STEP 3: For each unplayed game this round, provide tips using this methodology:
-- Bookmaker consensus is your baseline. Heavy favourites get tipped.
-- Use Squiggle model consensus as supporting data.
-- Factor in injuries and team news.
-- Be conservative. Boring correct tips win competitions.
-
-STEP 4: Respond ONLY with a single valid JSON object, no other text, no markdown, no backticks:
-{
-  "round": <number>,
-  "fetched": "<brief note on data sources used>",
-  "games": [
-    {"home": "Team", "away": "Team", "tip": "Team", "confidence": "High|Med|Low", "reason": "Max 10 words", "time": "e.g. Sat 28 Mar 12:35pm", "venue": "Venue name"}
-  ],
-  "game1_margin": <number>,
-  "safest": [
-    {"team": "Team", "opp": "Team", "reason": "one word"}
-  ],
-  "upset_watch": [
-    {"matchup": "Team vs Team", "reason": "One line"}
-  ],
-  "itipfooty": [
-    {"team": "Team", "opp": "Team", "conf": "H|M|L"}
-  ]
-}`;
+Respond with ONLY this JSON, no other text:
+{"round":1,"fetched":"sources used","games":[{"home":"Team","away":"Team","tip":"Team","confidence":"High","reason":"10 words max","time":"Sat 28 Mar 12:35pm","venue":"Venue"}],"game1_margin":14,"safest":[{"team":"Team","opp":"Team","reason":"word"},{"team":"Team","opp":"Team","reason":"word"},{"team":"Team","opp":"Team","reason":"word"}],"upset_watch":[{"matchup":"Team vs Team","reason":"one line"},{"matchup":"Team vs Team","reason":"one line"}],"itipfooty":[{"team":"Team","opp":"Team","conf":"H"}]}`;
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -861,9 +836,10 @@ STEP 4: Respond ONLY with a single valid JSON object, no other text, no markdown
         'anthropic-dangerous-direct-browser-access': 'true'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 4000,
-        system: 'You are Jezza5000, an AFL tipping assistant. After all research is complete, your FINAL message must be ONLY a valid JSON object with no preamble, explanation, or markdown. No backticks. Just raw JSON.',
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 800,
+        tools: [{ type: 'web_search_20260209', name: 'web_search', max_uses: 5 }],
+        system: 'You are a JSON API. You output ONLY raw valid JSON. No text before or after. No markdown. No backticks. No explanations. Your entire response must be parseable by JSON.parse(). If you include anything other than JSON, the application will crash.',
         messages: [{ role: 'user', content: prompt }]
       })
     });
@@ -882,16 +858,24 @@ STEP 4: Respond ONLY with a single valid JSON object, no other text, no markdown
     if (!textBlocks.length) throw new Error('No response from Claude');
 
     const raw = textBlocks[textBlocks.length - 1].text.trim();
-    const clean = raw.replace(/^```json|^```|```$/gm, '').trim();
 
     let tips;
-    try { tips = JSON.parse(clean); }
-    catch(e) {
-      // Try to extract JSON from the text
-      const match = clean.match(/\{[\s\S]*\}/);
-      if (match) tips = JSON.parse(match[0]);
-      else throw new Error('Could not parse tips response');
+    // Try multiple extraction strategies
+    const strategies = [
+      // 1. Raw text as-is
+      () => JSON.parse(raw),
+      // 2. Strip markdown fences
+      () => JSON.parse(raw.replace(/^```json\s*|^```\s*|\s*```$/gm, '').trim()),
+      // 3. Extract first { ... } block
+      () => { const m = raw.match(/\{[\s\S]*\}/); if(m) return JSON.parse(m[0]); throw new Error('no match'); },
+      // 4. Find { and slice from there
+      () => { const i = raw.indexOf('{'); if(i>=0) return JSON.parse(raw.slice(i)); throw new Error('no {'); }
+    ];
+    let lastErr;
+    for (const fn of strategies) {
+      try { tips = fn(); break; } catch(e) { lastErr = e; }
     }
+    if (!tips) throw new Error('Could not parse response. Claude returned: ' + raw.substring(0, 100));
 
     setStatus(`Round ${tips.round} tips ready`, 'success');
     render(tips);
