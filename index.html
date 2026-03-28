@@ -725,6 +725,7 @@
 <script>
 const YEAR = 2026;
 const KEY_STORAGE = 'jezza_api_key';
+const SQUIGGLE = 'https://api.squiggle.com.au';
 
 // API KEY MANAGEMENT
 function getApiKey() { return localStorage.getItem(KEY_STORAGE) || ''; }
@@ -769,7 +770,7 @@ function setStatus(msg, type='') {
   el.className = 'status ' + type;
 }
 
-// FORMAT HELPERS
+// HELPERS
 function formatTime(dateStr) {
   if (!dateStr) return '';
   try {
@@ -792,7 +793,6 @@ function shortenVenue(v) {
   return v.length > 22 ? v.substring(0,20)+'\u2026' : v;
 }
 
-// SKELETON
 function renderSkeleton() {
   document.getElementById('content').innerHTML = `
     <div class="skeleton"><div class="skel-line w80"></div><div class="skel-line w60"></div><div class="skel-line w40"></div></div>
@@ -807,190 +807,202 @@ function clearTips() {
   document.getElementById('last-updated').textContent = 'AFL Tipping Assistant';
 }
 
-// SINGLE CLAUDE CALL — fetches Squiggle via tool use + returns tips
-async function fetchTips() {
+// SQUIGGLE — fetch via multiple strategies to handle CORS
+async function squiggleFetch(path) {
+  const target = `${SQUIGGLE}/?${path};year=${YEAR}`;
+  // Try direct, then two CORS proxies
+  const attempts = [
+    () => fetch(target, {signal: AbortSignal.timeout(5000)}),
+    () => fetch(`https://corsproxy.io/?${encodeURIComponent(target)}`, {signal: AbortSignal.timeout(8000)}),
+    () => fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(target)}`, {signal: AbortSignal.timeout(8000)})
+  ];
+  for (const attempt of attempts) {
+    try {
+      const r = await attempt();
+      if (!r.ok) continue;
+      const data = await r.json();
+      if (data.contents) return JSON.parse(data.contents);
+      return data;
+    } catch(e) { continue; }
+  }
+  throw new Error('Could not reach Squiggle API');
+}
+
+// FIND CURRENT ROUND
+async function getCurrentRound() {
+  const data = await squiggleFetch('q=games');
+  const games = data.games || [];
+  const now = new Date();
+  const upcoming = games.filter(g => {
+    if (!g.date) return false;
+    return new Date(g.date) > new Date(now - 4*60*60*1000);
+  });
+  if (!upcoming.length) return null;
+  const rounds = [...new Set(upcoming.map(g => g.round))].sort((a,b)=>a-b);
+  return rounds[0];
+}
+
+// CLAUDE — cheap call, no web search, just Squiggle data in, JSON tips out
+async function claudeTips(games, squiggleTips, standings, round) {
   const apiKey = getApiKey();
-  if (!apiKey) { showSetup(); return; }
+  if (!apiKey) { showSetup(); throw new Error('No API key'); }
 
+  // Build compact data string — keep input tokens minimal
+  const gameLines = games.map((g, i) => {
+    const modelTips = squiggleTips.filter(t => t.gameid === g.id);
+    let consensus = 'unknown';
+    let avgMargin = null;
+    if (modelTips.length) {
+      const counts = {};
+      modelTips.forEach(t => { if(t.tip) counts[t.tip] = (counts[t.tip]||0)+1; });
+      const top = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0];
+      if (top) consensus = `${top[0]} ${top[1]}/${modelTips.length}`;
+      avgMargin = (modelTips.reduce((s,t)=>s+(parseFloat(t.margin)||0),0)/modelTips.length).toFixed(0);
+    }
+    return `G${i+1}:${g.hteam} v ${g.ateam}|${formatTime(g.date)}|${shortenVenue(g.venue)}|tip:${consensus}${avgMargin?'|margin:'+avgMargin:''}`;
+  }).join('\n');
+
+  const ladderLines = (standings||[]).slice(0,10).map(s=>`${s.rank}.${s.team}`).join(' ');
+
+  const prompt = `AFL Round ${round} ${YEAR}. Squiggle data:\n${gameLines}\nLadder top 10: ${ladderLines}\n\nTip each game. Use Squiggle consensus as primary signal. Ladder as tiebreaker. Conservative — tip favourites.\n\nJSON only, no other text:\n{"round":${round},"games":[{"home":"","away":"","tip":"","confidence":"High|Med|Low","reason":"<10 words","time":"","venue":""}],"game1_margin":0,"safest":[{"team":"","opp":"","reason":""},{"team":"","opp":"","reason":""},{"team":"","opp":"","reason":""}],"upset_watch":[{"matchup":"","reason":""},{"matchup":"","reason":""}],"itipfooty":[{"team":"","opp":"","conf":"H|M|L"}]}`;
+
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 600,
+      system: 'You are a JSON API. Output ONLY raw valid JSON. No text, no markdown, no backticks.',
+      messages: [{ role: 'user', content: prompt }]
+    })
+  });
+
+  if (r.status === 401) { showSetup(); document.getElementById('setup-error').textContent = 'Invalid API key.'; throw new Error('Invalid API key'); }
+  if (!r.ok) {
+    let msg = '';
+    try { const e = await r.json(); msg = e.error?.message || JSON.stringify(e); } catch(e) {}
+    throw new Error(`API ${r.status}: ${msg}`);
+  }
+
+  const data = await r.json();
+  const textBlocks = (data.content||[]).filter(b=>b.type==='text');
+  if (!textBlocks.length) throw new Error('No response from Claude');
+  const raw = textBlocks[textBlocks.length-1].text.trim();
+
+  // Robust JSON extraction
+  for (const fn of [
+    () => JSON.parse(raw),
+    () => JSON.parse(raw.replace(/^```json\s*|^```\s*|\s*```$/gm,'')),
+    () => { const m=raw.match(/\{[\s\S]*\}/); if(m) return JSON.parse(m[0]); throw 0; },
+    () => { const i=raw.indexOf('{'); if(i>=0) return JSON.parse(raw.slice(i)); throw 0; }
+  ]) { try { return fn(); } catch(e) {} }
+  throw new Error('Parse failed: ' + raw.substring(0,80));
+}
+
+// MAIN FLOW
+async function fetchTips() {
+  if (!getApiKey()) { showSetup(); return; }
   renderSkeleton();
-  setStatus('Asking Jezza5000…', 'loading');
-
-  const today = new Date().toLocaleDateString('en-AU', { weekday:'long', year:'numeric', month:'long', day:'numeric' });
-
-  const prompt = `Today: ${today}. AFL tipping assistant task.
-
-Search for: AFL round 2026 upcoming fixtures this week, Squiggle model tips, betting odds, injury news.
-
-Find unplayed games this round. For each game tip the favourite using bookmaker odds as baseline, Squiggle models as support. Be conservative.
-
-Respond with ONLY this JSON, no other text:
-{"round":1,"fetched":"sources used","games":[{"home":"Team","away":"Team","tip":"Team","confidence":"High","reason":"10 words max","time":"Sat 28 Mar 12:35pm","venue":"Venue"}],"game1_margin":14,"safest":[{"team":"Team","opp":"Team","reason":"word"},{"team":"Team","opp":"Team","reason":"word"},{"team":"Team","opp":"Team","reason":"word"}],"upset_watch":[{"matchup":"Team vs Team","reason":"one line"},{"matchup":"Team vs Team","reason":"one line"}],"itipfooty":[{"team":"Team","opp":"Team","conf":"H"}]}`;
+  setStatus('Fetching Squiggle data\u2026', 'loading');
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 800,
-        tools: [{ type: 'web_search_20260209', name: 'web_search', max_uses: 5 }],
-        system: 'You are a JSON API. You output ONLY raw valid JSON. No text before or after. No markdown. No backticks. No explanations. Your entire response must be parseable by JSON.parse(). If you include anything other than JSON, the application will crash.',
-        messages: [{ role: 'user', content: prompt }]
-      })
-    });
+    // Step 1: find current round
+    setStatus('Finding current round\u2026', 'loading');
+    const round = await getCurrentRound();
+    if (!round) throw new Error('No upcoming games found');
 
-    if (response.status === 401) { showSetup(); document.getElementById('setup-error').textContent = 'Invalid API key — please check and re-enter.'; throw new Error('Invalid API key'); }
-    if (!response.ok) {
-      let errBody = '';
-      try { const e = await response.json(); errBody = e.error?.message || JSON.stringify(e); } catch(e) {}
-      throw new Error(`API ${response.status}: ${errBody}`);
+    // Step 2: fetch games + tips + standings in parallel
+    setStatus(`Round ${round} \u2014 loading data\u2026`, 'loading');
+    const [gamesData, tipsData, standingsData] = await Promise.all([
+      squiggleFetch(`q=games;round=${round}`),
+      squiggleFetch(`q=tips;round=${round}`),
+      squiggleFetch('q=standings')
+    ]);
+
+    const games = (gamesData.games||[]).filter(g => !g.complete || g.complete < 100);
+    if (!games.length) {
+      setStatus('Round complete — no unplayed games.', 'error');
+      document.getElementById('content').innerHTML = `<div class="empty-state"><div class="empty-icon">\uD83C\uDFC1</div><div class="empty-title">Round Complete</div><div class="empty-sub">All games played. Check back next round.</div></div>`;
+      return;
     }
 
-    const data = await response.json();
-
-    // Extract the final text block (last text content block)
-    const textBlocks = (data.content || []).filter(b => b.type === 'text');
-    if (!textBlocks.length) throw new Error('No response from Claude');
-
-    const raw = textBlocks[textBlocks.length - 1].text.trim();
-
-    let tips;
-    // Try multiple extraction strategies
-    const strategies = [
-      // 1. Raw text as-is
-      () => JSON.parse(raw),
-      // 2. Strip markdown fences
-      () => JSON.parse(raw.replace(/^```json\s*|^```\s*|\s*```$/gm, '').trim()),
-      // 3. Extract first { ... } block
-      () => { const m = raw.match(/\{[\s\S]*\}/); if(m) return JSON.parse(m[0]); throw new Error('no match'); },
-      // 4. Find { and slice from there
-      () => { const i = raw.indexOf('{'); if(i>=0) return JSON.parse(raw.slice(i)); throw new Error('no {'); }
-    ];
-    let lastErr;
-    for (const fn of strategies) {
-      try { tips = fn(); break; } catch(e) { lastErr = e; }
-    }
-    if (!tips) throw new Error('Could not parse response. Claude returned: ' + raw.substring(0, 100));
+    // Step 3: ask Claude — cheap, no web search
+    setStatus('Getting tips from Jezza\u2026', 'loading');
+    const tips = await claudeTips(games, tipsData.tips||[], standingsData.standings||[], round);
 
     setStatus(`Round ${tips.round} tips ready`, 'success');
-    render(tips);
-    setTimeout(() => setStatus(''), 3000);
+    render(tips, games);
+    setTimeout(()=>setStatus(''), 3000);
 
   } catch(err) {
     console.error(err);
     setStatus('Error: ' + err.message, 'error');
-    document.getElementById('content').innerHTML = `
-      <div class="empty-state">
-        <div class="empty-icon">\u26a1</div>
-        <div class="empty-title">Something went wrong</div>
-        <div class="empty-sub">${err.message}<br><br>Check your connection and try again.</div>
-      </div>`;
+    document.getElementById('content').innerHTML = `<div class="empty-state"><div class="empty-icon">\u26A1</div><div class="empty-title">Something went wrong</div><div class="empty-sub">${err.message}<br><br>Check your connection and try again.</div></div>`;
   }
 }
 
 // RENDER
-function render(tipsData) {
+function render(tipsData, games) {
   const content = document.getElementById('content');
   const round = tipsData.round;
 
-  const badge = document.getElementById('round-badge');
-  badge.textContent = `RND ${round}`;
-  badge.style.display = 'block';
-  document.getElementById('last-updated').textContent =
-    'Updated ' + new Date().toLocaleTimeString('en-AU', {hour:'numeric',minute:'2-digit',hour12:true});
+  document.getElementById('round-badge').textContent = `RND ${round}`;
+  document.getElementById('round-badge').style.display = 'block';
+  document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString('en-AU',{hour:'numeric',minute:'2-digit',hour12:true});
 
   let html = '';
-
-  // Data source note
-  if (tipsData.fetched) {
-    html += `<div style="font-family:var(--font-mono,monospace);font-size:10px;color:var(--text-dim);margin-bottom:16px;line-height:1.5;padding:8px 12px;background:var(--card);border-radius:8px;border:1px solid var(--border)">${tipsData.fetched}</div>`;
-  }
-
-  // MATCH CARDS
   html += `<div class="section-label">Round ${round} — Work Comp</div>`;
   html += `<div class="matches stagger">`;
 
-  (tipsData.games || []).forEach((g, i) => {
-    const isGame1 = i === 0;
-    const homeWins = g.tip === g.home;
-    const awayWins = g.tip === g.away;
-    const confClass = g.confidence === 'High' ? 'conf-high' : g.confidence === 'Med' ? 'conf-med' : 'conf-low';
+  (tipsData.games||[]).forEach((g,i) => {
+    const isGame1 = i===0;
+    const homeWins = g.tip===g.home;
+    const awayWins = g.tip===g.away;
+    const confClass = g.confidence==='High'?'conf-high':g.confidence==='Med'?'conf-med':'conf-low';
+    const sq = games[i]||{};
 
-    html += `<div class="match-card${isGame1 ? ' is-game1' : ''}">`;
-    if (isGame1) html += `<div class="game1-tag">\u2605 Game 1 \u2014 Margin Tip Active</div>`;
-
-    html += `<div class="match-meta">
-      <span class="match-time">${g.time || ''}</span>
-      <span class="match-venue">${g.venue || ''}</span>
-    </div>`;
-
+    html += `<div class="match-card${isGame1?' is-game1':''}">`;
+    if (isGame1) html += `<div class="game1-tag">\u2605 Game 1 \u2014 Margin Tip</div>`;
+    html += `<div class="match-meta"><span class="match-time">${g.time||formatTime(sq.date)}</span><span class="match-venue">${g.venue||shortenVenue(sq.venue)}</span></div>`;
     html += `<div class="match-teams">
-      <div class="team home${homeWins?' tipped':''}">
-        <span class="team-label">Home</span>
-        <span class="team-name">${g.home}</span>
-      </div>
+      <div class="team home${homeWins?' tipped':''}"><span class="team-label">Home</span><span class="team-name">${g.home}</span></div>
       <span class="vs">vs</span>
-      <div class="team away${awayWins?' tipped':''}">
-        <span class="team-label">Away</span>
-        <span class="team-name">${g.away}</span>
-      </div>
+      <div class="team away${awayWins?' tipped':''}"><span class="team-label">Away</span><span class="team-name">${g.away}</span></div>
     </div>`;
-
     html += `<div class="match-footer">
       <span class="confidence-pill ${confClass}">${g.confidence}</span>
       <span class="tip-label"><strong>${g.tip}</strong> \u2014 ${g.reason}</span>
-      ${isGame1 && tipsData.game1_margin ? `<span class="margin-pill">by ${tipsData.game1_margin}</span>` : ''}
-    </div>`;
-    html += `</div>`;
+      ${isGame1&&tipsData.game1_margin?`<span class="margin-pill">by ${tipsData.game1_margin}</span>`:''}
+    </div></div>`;
   });
   html += `</div>`;
 
-  // SAFEST TIPS
-  if (tipsData.safest && tipsData.safest.length) {
-    html += `<div class="info-section fade-in"><div class="section-label">Safest Tips</div>`;
-    html += `<div class="info-card"><div class="info-card-header"><span>\uD83D\uDD12</span> Lock these in</div>`;
-    tipsData.safest.forEach((s, i) => {
-      html += `<div class="info-row">
-        <span class="info-row-rank">${i+1}</span>
-        <span class="info-row-team">${s.team}</span>
-        <span class="info-row-opp">v ${s.opp}</span>
-        <span class="safe-badge">${s.reason}</span>
-      </div>`;
+  if (tipsData.safest&&tipsData.safest.length) {
+    html += `<div class="info-section fade-in"><div class="section-label">Safest Tips</div><div class="info-card"><div class="info-card-header"><span>\uD83D\uDD12</span> Lock these in</div>`;
+    tipsData.safest.forEach((s,i) => {
+      html += `<div class="info-row"><span class="info-row-rank">${i+1}</span><span class="info-row-team">${s.team}</span><span class="info-row-opp">v ${s.opp}</span><span class="safe-badge">${s.reason}</span></div>`;
     });
     html += `</div></div>`;
   }
 
-  // UPSET WATCH
-  if (tipsData.upset_watch && tipsData.upset_watch.length) {
-    html += `<div class="info-section fade-in"><div class="section-label">Upset Watch</div>`;
-    html += `<div class="info-card"><div class="info-card-header"><span>\u26A0</span> Proceed with caution</div>`;
+  if (tipsData.upset_watch&&tipsData.upset_watch.length) {
+    html += `<div class="info-section fade-in"><div class="section-label">Upset Watch</div><div class="info-card"><div class="info-card-header"><span>\u26A0</span> Proceed with caution</div>`;
     tipsData.upset_watch.forEach(u => {
-      html += `<div class="info-row">
-        <span class="info-row-team" style="font-size:13px">${u.matchup}</span>
-        <span class="upset-badge">risky</span>
-      </div>
-      <div style="padding:0 16px 10px;font-size:12px;color:var(--text-muted);border-bottom:1px solid var(--border)">${u.reason}</div>`;
+      html += `<div class="info-row"><span class="info-row-team" style="font-size:13px">${u.matchup}</span><span class="upset-badge">risky</span></div><div style="padding:0 16px 10px;font-size:12px;color:var(--text-muted);border-bottom:1px solid var(--border)">${u.reason}</div>`;
     });
     html += `</div></div>`;
   }
 
-  // ITIPFOOTY
-  if (tipsData.itipfooty && tipsData.itipfooty.length) {
-    html += `<div class="info-section fade-in"><div class="section-label">iTipFooty — Dad\'s Comp</div>`;
-    html += `<div class="info-card"><div class="info-card-header"><span>\uD83C\uDFC6</span> Keep the streak alive</div>`;
+  if (tipsData.itipfooty&&tipsData.itipfooty.length) {
+    html += `<div class="info-section fade-in"><div class="section-label">iTipFooty \u2014 Dad\'s Comp</div><div class="info-card"><div class="info-card-header"><span>\uD83C\uDFC6</span> Keep the streak alive</div>`;
     tipsData.itipfooty.forEach(t => {
-      const confClass = t.conf === 'H' ? 'conf-high' : t.conf === 'M' ? 'conf-med' : 'conf-low';
-      html += `<div class="itip-row">
-        <span class="itip-check">\u2713</span>
-        <span class="itip-team">${t.team}</span>
-        <span class="itip-opp">v ${t.opp}</span>
-        <span class="confidence-pill ${confClass}" style="font-size:9px;padding:3px 7px">${t.conf}</span>
-      </div>`;
+      const cc = t.conf==='H'?'conf-high':t.conf==='M'?'conf-med':'conf-low';
+      html += `<div class="itip-row"><span class="itip-check">\u2713</span><span class="itip-team">${t.team}</span><span class="itip-opp">v ${t.opp}</span><span class="confidence-pill ${cc}" style="font-size:9px;padding:3px 7px">${t.conf}</span></div>`;
     });
     html += `</div></div>`;
   }
