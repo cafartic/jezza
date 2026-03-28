@@ -840,7 +840,7 @@ Respond with ONLY this JSON, no other text, no markdown:
     body: JSON.stringify({
       model: 'claude-sonnet-4-6',
       max_tokens: 700,
-      tools: [{ type: 'web_fetch_20250124', name: 'web_fetch' }],
+      tools: [{ type: 'web_fetch_20260309', name: 'web_fetch' }],
       system: 'You are a JSON API. Fetch the requested URLs using your web_fetch tool, then output ONLY raw valid JSON. No text before or after. No markdown. No backticks.',
       messages: [{ role: 'user', content: prompt }]
     })
