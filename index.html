@@ -836,7 +836,7 @@ Respond with ONLY this JSON, no other text:
         'anthropic-dangerous-direct-browser-access': 'true'
       },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
+        model: 'claude-sonnet-4-6',
         max_tokens: 800,
         tools: [{ type: 'web_search_20260209', name: 'web_search', max_uses: 5 }],
         system: 'You are a JSON API. You output ONLY raw valid JSON. No text before or after. No markdown. No backticks. No explanations. Your entire response must be parseable by JSON.parse(). If you include anything other than JSON, the application will crash.',
