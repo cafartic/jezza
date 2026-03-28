@@ -810,22 +810,27 @@ function clearTips() {
 // SQUIGGLE — fetch via multiple strategies to handle CORS
 async function squiggleFetch(path) {
   const target = `${SQUIGGLE}/?${path};year=${YEAR}`;
-  // Try direct, then two CORS proxies
-  const attempts = [
-    () => fetch(target, {signal: AbortSignal.timeout(5000)}),
-    () => fetch(`https://corsproxy.io/?${encodeURIComponent(target)}`, {signal: AbortSignal.timeout(8000)}),
-    () => fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(target)}`, {signal: AbortSignal.timeout(8000)})
+  const proxies = [
+    url => url,
+    url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    url => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+    url => `https://thingproxy.freeboard.io/fetch/${url}`,
+    url => `https://api.codetabs.com/v1/proxy?quest=${url}`
   ];
-  for (const attempt of attempts) {
+  for (const proxy of proxies) {
     try {
-      const r = await attempt();
+      const r = await fetch(proxy(target), {signal: AbortSignal.timeout(10000)});
       if (!r.ok) continue;
       const data = await r.json();
-      if (data.contents) return JSON.parse(data.contents);
-      return data;
+      // allorigins wraps in {contents}
+      if (data && data.contents) return JSON.parse(data.contents);
+      // codetabs returns array or object directly
+      if (data && (data.games || data.tips || data.standings)) return data;
+      // direct response
+      if (data) return data;
     } catch(e) { continue; }
   }
-  throw new Error('Could not reach Squiggle API');
+  throw new Error('Could not reach Squiggle API — try again or check connection');
 }
 
 // FIND CURRENT ROUND
