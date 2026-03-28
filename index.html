@@ -869,7 +869,11 @@ STEP 4: Respond ONLY with a single valid JSON object, no other text, no markdown
     });
 
     if (response.status === 401) { showSetup(); document.getElementById('setup-error').textContent = 'Invalid API key — please check and re-enter.'; throw new Error('Invalid API key'); }
-    if (!response.ok) throw new Error(`API error ${response.status}`);
+    if (!response.ok) {
+      let errBody = '';
+      try { const e = await response.json(); errBody = e.error?.message || JSON.stringify(e); } catch(e) {}
+      throw new Error(`API ${response.status}: ${errBody}`);
+    }
 
     const data = await response.json();
 
